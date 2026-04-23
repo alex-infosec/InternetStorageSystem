@@ -1,323 +1,310 @@
-/*
- * client.java
- * CIS4930 - Internet Storage Systems, Spring 2026
- * PA3: Concurrent Batched File Transfer Client
- */
 
-import java.io.BufferedInputStream;
-import java.io.BufferedOutputStream;
-import java.io.File;
-import java.io.FileOutputStream;
-import java.io.IOException;
-import java.io.InputStream;
-import java.io.OutputStream;
-import java.net.Socket;
-import java.net.UnknownHostException;
+import java.io.*;
+import java.net.*;
 import java.nio.charset.StandardCharsets;
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Locale;
-import java.util.Map;
-import java.util.Scanner;
+import java.util.*;
 
 public class client {
 
-    private static final String DISCONNECT_COMMAND = "bye";
-    private static final String DISCONNECT_RESPONSE = "disconnected";
-    private static final String INVALID_COMMAND_MESSAGE = "Please type a different command";
-    private static final int MIN_RUNS_FOR_STATS = 5;
-    private static final int FILES_PER_BATCH = 10;
+    //protocol constants
+    private static final String DISCONNECT_CMD = "bye";
+
+    //folder where received files are saved on client machine
     private static final String DOWNLOAD_FOLDER = "client_files";
 
+    //total files server holds 
+    private static final int TOTAL_FILES = 10;
+
+    //stats are autoprinted after successful trials
+    private static final int STATS_INTERVAL = 5;
+
+    //entry point
     public static void main(String[] args) {
         if (args.length != 2) {
             System.err.println("Usage: java client [serverURL] [port_number]");
             System.exit(1);
         }
 
-        String hostName = args[0];
-        int portNumber;
+        String host = args[0];
+        int port;
         try {
-            portNumber = Integer.parseInt(args[1]);
+            port = Integer.parseInt(args[1]);
         } catch (NumberFormatException e) {
             System.err.println("Port number must be an integer.");
+            System.exit(1);
             return;
         }
 
+        //create local download directory for received files
         File downloadDir = new File(DOWNLOAD_FOLDER);
         if (!downloadDir.exists()) {
             downloadDir.mkdirs();
         }
         System.out.println("Saving received files to: " + downloadDir.getAbsolutePath());
 
-        Map<Integer, List<Double>> rttByBatchSize = new HashMap<>();
-        rttByBatchSize.put(1, new ArrayList<>());
-        rttByBatchSize.put(2, new ArrayList<>());
-        rttByBatchSize.put(3, new ArrayList<>());
-
+        //server connection and main command loop
         try (
-                Socket socket = new Socket(hostName, portNumber);
-                InputStream rawIn = new BufferedInputStream(socket.getInputStream());
-                OutputStream rawOut = socket.getOutputStream();
-                Scanner scanner = new Scanner(System.in)
+            Socket       socket  = new Socket(host, port);
+            InputStream  rawIn   = new BufferedInputStream(socket.getInputStream());
+            OutputStream rawOut  = socket.getOutputStream();
+            Scanner      scanner = new Scanner(System.in)
         ) {
+            //receive and print "Hello!"
             String greeting = readLine(rawIn);
             if (greeting != null) {
                 System.out.println(greeting);
             }
 
-            while (true) {
-                System.out.print("Enter command (SEND or 'bye'): ");
-                String userInput = scanner.nextLine().trim();
+            //RTT lists keyed by batch size (1, 2, ..)
+            //each entry accumulates across repeated SEND calls
+            Map<Integer, List<Double>> rttsByBatch = new HashMap<>();
 
-                if (DISCONNECT_COMMAND.equalsIgnoreCase(userInput)) {
-                    sendLine(rawOut, DISCONNECT_COMMAND);
-                    String response = readLine(rawIn);
-                    if (response != null) {
-                        System.out.println(response);
+            //main loop
+            while (true) {
+                System.out.print("Enter command: ");
+                String input = scanner.nextLine().trim();
+
+                if (input.isEmpty()) {
+                    continue;
+                }
+
+                //client sends "bye", server replies "disconnected"
+                //client prints both then prints "exit" and exits
+                if (DISCONNECT_CMD.equalsIgnoreCase(input)) {
+                    sendLine(rawOut, DISCONNECT_CMD);
+                    String resp = readLine(rawIn);
+                    if (resp != null) {
+                        System.out.println(resp);
                     }
                     System.out.println("exit");
                     break;
                 }
 
-                int batchSize;
-                if ("SEND".equalsIgnoreCase(userInput)) {
-                    System.out.print("Enter batch size (1, 2, or 3): ");
-                    String batchSizeText = scanner.nextLine().trim();
-                    try {
-                        batchSize = Integer.parseInt(batchSizeText);
-                    } catch (NumberFormatException e) {
-                        System.out.println("Batch size must be 1, 2, or 3.");
-                        continue;
-                    }
-                    if (batchSize < 1 || batchSize > 3) {
-                        System.out.println("Batch size must be 1, 2, or 3.");
-                        continue;
-                    }
-                } else {
-                    sendLine(rawOut, userInput);
-                    String response = readLine(rawIn);
-                    if (response == null) {
-                        System.out.println("Server closed the connection.");
-                        break;
-                    }
-                    System.out.println(response);
-                    continue;
-                }
-
-                List<Integer> sequence = randomSequence1To10();
-                String seqLine = toSequenceLine(sequence);
-
-                long startTime = System.nanoTime();
-                sendLine(rawOut, "SEND " + batchSize);
-                sendLine(rawOut, "SEQ " + seqLine);
-
-                String firstResponse = readLine(rawIn);
-                if (firstResponse == null) {
-                    System.out.println("Server closed the connection.");
-                    break;
-                }
-                if (firstResponse.startsWith("ERROR:") || INVALID_COMMAND_MESSAGE.equals(firstResponse)) {
-                    System.out.println(firstResponse);
-                    continue;
-                }
-                if (!firstResponse.startsWith("BATCH_BEGIN ")) {
-                    System.out.println("Unexpected server response: " + firstResponse);
-                    continue;
-                }
-
-                int expectedRounds;
-                try {
-                    expectedRounds = Integer.parseInt(firstResponse.substring("BATCH_BEGIN ".length()).trim());
-                } catch (NumberFormatException e) {
-                    System.out.println("Invalid BATCH_BEGIN response: " + firstResponse);
-                    continue;
-                }
-
-                boolean transferFailed = false;
-                for (int round = 1; round <= expectedRounds; round++) {
-                    for (int i = 0; i < FILES_PER_BATCH; i++) {
-                        String fileHeader = readLine(rawIn);
-                        if (fileHeader == null) {
-                            System.out.println("Connection closed while waiting for file header.");
-                            transferFailed = true;
-                            break;
-                        }
-
-                        FileHeader parsed = parseFileHeader(fileHeader);
-                        if (parsed == null) {
-                            System.out.println("Unexpected file header: " + fileHeader);
-                            transferFailed = true;
-                            break;
-                        }
-
-                        String localName = "b" + batchSize + "_r" + round + "_" + parsed.fileName;
-                        File outFile = new File(downloadDir, safeLocalFileName(localName));
+                //user sends "SEND", batch size can be provided as an optional argument
+                if (input.toUpperCase().startsWith("SEND")) {
+                    int batchSize = 1; // default batch size
+                    String[] parts = input.split("\\s+");
+                    if (parts.length >= 2) {
                         try {
-                            receiveToFile(rawIn, outFile, parsed.fileSize);
-                        } catch (IOException e) {
-                            System.out.println("ERROR: " + e.getMessage());
-                            transferFailed = true;
-                            break;
+                            batchSize = Integer.parseInt(parts[1]);
+                            if (batchSize < 1) {
+                                System.out.println("Batch size must be >= 1. Try again.");
+                                continue;
+                            }
+                        } catch (NumberFormatException e) {
+                            System.out.println("Invalid batch size. Usage: SEND <batchSize>");
+                            continue;
                         }
                     }
-                    if (transferFailed) {
-                        break;
+
+                    //RRT function
+                    double rtt = performTransfer(rawIn, rawOut, batchSize, downloadDir);
+
+                    if (rtt >= 0) {
+                        //print RTT immediately after each round trip
+                        System.out.printf("Round-trip time: %.3f ms%n", rtt);
+
+                        //accumulate RTT for this batch size
+                        rttsByBatch.computeIfAbsent(batchSize, k -> new ArrayList<>()).add(rtt);
+
+                        //autoprint stats after every successful trial
+                        List<Double> rtts = rttsByBatch.get(batchSize);
+                        if (rtts.size() % STATS_INTERVAL == 0) {
+                            printStatistics(rtts, batchSize);
+                        }
                     }
-                }
-
-                if (transferFailed) {
                     continue;
                 }
 
-                String endMarker = readLine(rawIn);
-                if (!"BATCH_END".equals(endMarker)) {
-                    System.out.println("Unexpected end marker: " + endMarker);
-                    continue;
-                }
-
-                long endTime = System.nanoTime();
-                double rttMillis = (endTime - startTime) / 1_000_000.0;
-                List<Double> statsList = rttByBatchSize.get(batchSize);
-                statsList.add(rttMillis);
-
-                System.out.println("Round-trip time (batch size " + batchSize + "): " + formatDouble(rttMillis) + " ms");
-
-                if (statsList.size() % MIN_RUNS_FOR_STATS == 0) {
-                    System.out.println();
-                    System.out.println("Statistics for batch size " + batchSize + " after " + statsList.size() + " runs:");
-                    printStatistics(statsList);
-                    System.out.println();
+                //unknown command
+                //server replies "Please type a different command"
+                //client prints server's error message and re-prompts
+                sendLine(rawOut, input);
+                String serverResp = readLine(rawIn);
+                if (serverResp != null) {
+                    System.out.println(serverResp);
                 }
             }
 
         } catch (UnknownHostException e) {
-            System.err.println("Unknown host " + hostName + ": " + e.getMessage());
+            System.err.println("Unknown host: " + host);
         } catch (IOException e) {
-            System.err.println("I/O error while communicating with " + hostName + ": " + e.getMessage());
+            System.err.println("I/O error: " + e.getMessage());
         }
     }
 
-    private static List<Integer> randomSequence1To10() {
-        List<Integer> seq = new ArrayList<>();
-        for (int i = 1; i <= FILES_PER_BATCH; i++) {
-            seq.add(i);
-        }
-        Collections.shuffle(seq);
-        return seq;
-    }
+    //one complete transfer of all TOTAL_FILES files
+    private static double performTransfer(InputStream rawIn, OutputStream rawOut, int batchSize, File downloadDir) throws IOException {
+        //generate random permutation of 1..TOTAL_FILES
+        List<Integer> sequence = new ArrayList<>();
+        for (int i = 1; i <= TOTAL_FILES; i++) sequence.add(i);
+        Collections.shuffle(sequence, new Random());
 
-    private static String toSequenceLine(List<Integer> sequence) {
-        StringBuilder sb = new StringBuilder();
-        for (int i = 0; i < sequence.size(); i++) {
-            if (i > 0) {
-                sb.append(' ');
-            }
-            sb.append(sequence.get(i));
-        }
-        return sb.toString();
-    }
+        //build SEQ n1 n2 ... n10
+        StringBuilder seqBuilder = new StringBuilder("SEQ");
+        for (int idx : sequence) seqBuilder.append(' ').append(idx);
 
-    private static FileHeader parseFileHeader(String header) {
-        if (header == null || !header.startsWith("FILE ")) {
-            return null;
-        }
-        String[] parts = header.split("\\s+", 3);
-        if (parts.length != 3) {
-            return null;
-        }
+        //start timer
+        long startMs = System.currentTimeMillis();
+
+        //send SEND and SEQ to server
+        sendLine(rawOut, "SEND " + batchSize);
+        sendLine(rawOut, seqBuilder.toString());
+
+        //receive and save each file
+        int filesReceived = 0;
         try {
-            long size = Long.parseLong(parts[2]);
-            return new FileHeader(parts[1], size);
-        } catch (NumberFormatException e) {
-            return null;
+            loop:
+            while (true) {
+                String header = readLine(rawIn);
+                if (header == null) {
+                    System.out.println("Server closed connection unexpectedly.");
+                    return -1;
+                }
+                header = header.trim();
+
+                //server groups files into sub-batches
+                if (header.startsWith("BATCH_START")) {
+                    String[] parts = header.split("\\s+");
+                    int count;
+                    try {
+                        count = Integer.parseInt(parts[1]);
+                    } catch (NumberFormatException | ArrayIndexOutOfBoundsException e) {
+                        System.out.println("Malformed BATCH_START header: " + header);
+                        return -1;
+                    }
+
+                    //receive `count` files in sub-batch
+                    for (int i = 0; i < count; i++) {
+                        String fileHeader = readLine(rawIn);
+                        if (fileHeader == null || !fileHeader.startsWith("FILE ")) {
+                            System.out.println("Unexpected file header: " + fileHeader);
+                            return -1;
+                        }
+                        //parse file and size
+                        String[] fp = fileHeader.split("\\s+");
+                        if (fp.length < 3) {
+                            System.out.println("Malformed FILE header: " + fileHeader);
+                            return -1;
+                        }
+                        String fileName = fp[1];
+                        long fileSize;
+                        try {
+                            fileSize = Long.parseLong(fp[2]);
+                        } catch (NumberFormatException e) {
+                            System.out.println("Invalid file size in header: " + fileHeader);
+                            return -1;
+                        }
+
+                        //save received file to the download directory
+                        File outFile = new File(downloadDir, sanitizeFileName(fileName));
+                        receiveToFile(rawIn, outFile, fileSize);
+                        filesReceived++;
+                        System.out.println("Received: " + outFile.getName()
+                                + " (" + fileSize + " bytes)");
+                    }
+
+                } else if ("BATCH_END".equals(header)) {
+                    //all 10 files have been delivered, exit receive loop
+                    break loop;
+
+                } else if (header.startsWith("ERROR")) {
+                    //server reported a problem, print and abort
+                    System.out.println(header);
+                    return -1;
+
+                } else {
+                    System.out.println("Unexpected server message: " + header);
+                    return -1;
+                }
+            }
+        } catch (IOException e) {
+            System.out.println("Error receiving files: " + e.getMessage());
+            return -1;
         }
+
+        //stop timer, compute and return RTT
+        long endMs = System.currentTimeMillis();
+        double rttMs = (double) (endMs - startMs);
+
+        System.out.println("Received " + filesReceived + "/" + TOTAL_FILES + " files.");
+        return rttMs;
     }
 
+    //computes min, mean, max, and standard deviation from the accumulated RTT list
+    private static void printStatistics(List<Double> rtts, int batchSize) {
+        double min = Double.MAX_VALUE;
+        double max = -Double.MAX_VALUE;
+        double sum = 0.0;
+
+        for (double rtt : rtts) {
+            if (rtt < min) min = rtt;
+            if (rtt > max) max = rtt;
+            sum += rtt;
+        }
+        double mean = sum / rtts.size();
+
+        //standard deviation
+        double varSum = 0.0;
+        for (double rtt : rtts) {
+            double diff = rtt - mean;
+            varSum += diff * diff;
+        }
+        double stdDev = Math.sqrt(varSum / rtts.size());
+
+        System.out.println();
+        System.out.println("=== RTT Statistics | Batch Size: " + batchSize
+                + " | Trials: " + rtts.size() + " ===");
+        System.out.printf("  Minimum : %.3f ms%n", min);
+        System.out.printf("  Mean    : %.3f ms%n", mean);
+        System.out.printf("  Maximum : %.3f ms%n", max);
+        System.out.printf("  Std Dev : %.3f ms%n", stdDev);
+        System.out.println("=================================================");
+        System.out.println();
+    }
+
+    //I/O helpers
+    //UTF-8 text line terminated by '\n' and flush immediately
     private static void sendLine(OutputStream out, String line) throws IOException {
         out.write((line + "\n").getBytes(StandardCharsets.UTF_8));
         out.flush();
     }
 
+    // Read a \n-terminated line byte-by-byte
     private static String readLine(InputStream in) throws IOException {
         StringBuilder sb = new StringBuilder();
         while (true) {
             int b = in.read();
-            if (b == -1) {
-                return sb.length() == 0 ? null : sb.toString();
-            }
-            if (b == '\n') {
-                break;
-            }
-            if (b != '\r') {
-                sb.append((char) b);
-            }
+            if (b == -1) return sb.length() == 0 ? null : sb.toString(); // EOF
+            if (b == '\n') break;
+            if (b != '\r') sb.append((char) b);
         }
         return sb.toString();
     }
 
-    private static void receiveToFile(InputStream in, File outFile, long byteCount) throws IOException {
-        if (byteCount < 0) {
-            throw new IOException("Invalid byte count: " + byteCount);
-        }
-
-        byte[] buffer = new byte[8192];
-        long remaining = byteCount;
-
+    //receive size bytes from the stream and write them to outFile
+    private static void receiveToFile(InputStream in, File outFile, long size) throws IOException {
+        if (size < 0) throw new IOException("Invalid file size: " + size);
+        byte[] buffer    = new byte[65536];
+        long   remaining = size;
         try (OutputStream fos = new BufferedOutputStream(new FileOutputStream(outFile))) {
             while (remaining > 0) {
                 int toRead = (int) Math.min(buffer.length, remaining);
-                int read = in.read(buffer, 0, toRead);
+                int read   = in.read(buffer, 0, toRead);
                 if (read == -1) {
-                    throw new IOException("Connection closed while receiving file. Remaining bytes: " + remaining);
+                    throw new IOException(
+                            "Connection closed before file fully received. "
+                            + remaining + " bytes still expected.");
                 }
                 fos.write(buffer, 0, read);
                 remaining -= read;
             }
-            fos.flush();
         }
     }
 
-    private static String safeLocalFileName(String requestedName) {
-        String name = requestedName.replace("\\", "_").replace("/", "_");
-        return name.isBlank() ? "downloaded_file" : name;
-    }
-
-    private static void printStatistics(List<Double> rtts) {
-        if (rtts.isEmpty()) {
-            System.out.println("No data.");
-            return;
-        }
-        double min = Double.MAX_VALUE;
-        double max = Double.MIN_VALUE;
-        double sum = 0.0;
-        for (double rtt : rtts) {
-            if (rtt < min) {
-                min = rtt;
-            }
-            if (rtt > max) {
-                max = rtt;
-            }
-            sum += rtt;
-        }
-        double mean = sum / rtts.size();
-        double varianceSum = 0.0;
-        for (double rtt : rtts) {
-            double diff = rtt - mean;
-            varianceSum += diff * diff;
-        }
-        double stdDev = Math.sqrt(varianceSum / rtts.size());
-
-        System.out.println("Minimum: " + formatDouble(min));
-        System.out.println("Mean   : " + formatDouble(mean));
-        System.out.println("Maximum: " + formatDouble(max));
-        System.out.println("Std Dev: " + formatDouble(stdDev));
-    }
-
-    private static String formatDouble(double value) {
-        return String.format(Locale.US, "%.3f", value);
+    //strip path separators and characters that are illegal in filenames
+    private static String sanitizeFileName(String name) {
+        return name.replaceAll("[/\\\\:*?\"<>|]", "_");
     }
 
     private static class FileHeader {
